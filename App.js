@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { StyleSheet, Text, View, ActivityIndicator, Platform, Image, Animated, Easing } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'; 
 import { useKeepAwake } from 'expo-keep-awake';
 import { useFonts } from 'expo-font';
+import * as Location from 'expo-location';
 
 const fetchHeaders = {
   'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
@@ -10,21 +11,11 @@ const fetchHeaders = {
 };
 
 function TickerApp() {
-  if (Platform.OS !== 'web') {
-    useKeepAwake();
-  }
+  useKeepAwake();
 
   const [fontsLoaded] = useFonts({
     SFShields: require('./assets/Fonts/sf-display-shields-compressed-bold.otf'),
   });
-
-  if (!fontsLoaded) {
-    return (
-      <SafeAreaView style={styles.wrapper}>
-        <ActivityIndicator size="large" color="#0A84FF" />
-      </SafeAreaView>
-    );
-  }
 
   const [currentIndex, setCurrentIndex] = useState(0);
   const [displayCycle, setDisplayCycle] = useState([]);
@@ -32,6 +23,7 @@ function TickerApp() {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [hebrewDate, setHebrewDate] = useState("");
   const [alertsCount, setAlertsCount] = useState(0);
+  const [havdalahTime, setHavdalahTime] = useState(null);
   
   // Animation value for the progress bar
   const progressAnim = useRef(new Animated.Value(0)).current;
@@ -84,7 +76,67 @@ function TickerApp() {
   }, []);
 
   useEffect(() => {
-    const fetchData = async () => {
+    let cancelled = false;
+
+    const computeHavdalah = async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          setHavdalahTime('Location denied');
+          return;
+        }
+
+        const loc = await Location.getCurrentPositionAsync({});
+        const lat = loc.coords.latitude;
+        const lon = loc.coords.longitude;
+
+        // Prefer Hebcal's shabbat API for accurate havdalah times
+        const today = new Date();
+        const dateStr = today.toISOString().split('T')[0];
+        const hebcalUrl = `https://www.hebcal.com/shabbat/?cfg=json&latitude=${lat}&longitude=${lon}&date=${dateStr}`;
+        try {
+          const hres = await fetch(hebcalUrl, { headers: fetchHeaders });
+          if (hres.ok) {
+            const hjson = await hres.json();
+            const items = hjson.items || [];
+            const hav = items.find(i => (i.category && i.category.toLowerCase() === 'havdalah') || (i.title && /havdalah/i.test(i.title)));
+            if (hav && hav.date) {
+              const havDate = new Date(hav.date);
+              if (!cancelled) {
+                setHavdalahTime(havDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }));
+                return;
+              }
+            }
+          }
+        } catch (e) {
+          // fall through to sunrise-sunset fallback
+        }
+
+        // Fallback: sunrise-sunset service (if Hebcal unavailable)
+        const res = await fetch(`https://api.sunrise-sunset.org/json?lat=${lat}&lng=${lon}&date=${dateStr}&formatted=0`);
+        if (!res.ok) throw new Error('Sunset fetch failed');
+        const json = await res.json();
+        const sunsetIso = json.results?.sunset;
+        if (!sunsetIso) throw new Error('No sunset returned');
+
+        const offsetMinutes = 72; // fallback community default
+        const sunsetDate = new Date(sunsetIso);
+        sunsetDate.setMinutes(sunsetDate.getMinutes() + offsetMinutes);
+
+        if (!cancelled) {
+          setHavdalahTime(sunsetDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }));
+        }
+      } catch (e) {
+        if (!cancelled) setHavdalahTime('Unavailable');
+      }
+    };
+
+    computeHavdalah();
+    const interval = setInterval(computeHavdalah, 1000 * 60 * 30);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
+
+  const fetchData = useCallback(async () => {
       try {
         console.log("Syncing Real Premium Data...");
 
@@ -196,8 +248,10 @@ function TickerApp() {
                   league: league.toUpperCase(), date: 'OFFSEASON',
                   awayAbbr: 'TBA', awayScore: '-', awayName: 'Away',
                   awayLogo: `https://a.espncdn.com/i/teamlogos/${league}/500/${abbr.toLowerCase()}.png`,
+                  awayRecord: '',
                   homeAbbr: abbr, homeScore: '-', homeName: teamName,
                   homeLogo: `https://a.espncdn.com/i/teamlogos/${league}/500/${abbr.toLowerCase()}.png`,
+                  homeRecord: record,
                   status: 'No Active Games', situation: null,
                   topPlay: 'Awaiting schedule release...',
                   playerGlance: { name: teamName.toUpperCase(), subtext: '', stats: 'Offseason or Schedule Unavailable' },
@@ -225,16 +279,34 @@ function TickerApp() {
             if (events.length === 0) events = await fetchSchedule(2, new Date().getFullYear()); 
             if (events.length === 0) events = await fetchSchedule(2, new Date().getFullYear() - 1); 
             
-            if (events.length === 0 && teamJson.team?.nextEvent?.length > 0) {
-                events = teamJson.team.nextEvent;
+            const teamNextEvent = teamJson.team?.nextEvent?.[0];
+            if (teamNextEvent && !events.some(e => e.id === teamNextEvent.id)) {
+                events.unshift(teamNextEvent);
+            }
+            if (events.length === 0 && teamNextEvent) {
+                events = [teamNextEvent];
             }
 
             if (events.length === 0) return fallbackCard;
             
-            let targetEvent = events.find(e => e?.competitions?.[0]?.status?.type?.state === 'in');
-            if (!targetEvent) {
-              const pastGames = events.filter(e => e?.competitions?.[0]?.status?.type?.state === 'post');
-              targetEvent = pastGames.length > 0 ? pastGames[pastGames.length - 1] : events[0];
+            const liveEvent = events.find(e => e?.competitions?.[0]?.status?.type?.state === 'in');
+            let pastGames = events.filter(e => e?.competitions?.[0]?.status?.type?.state === 'post');
+            pastGames.sort((a, b) => new Date(b.date) - new Date(a.date));
+            let upcomingGames = events.filter(e => e?.competitions?.[0]?.status?.type?.state === 'pre');
+            upcomingGames.sort((a, b) => new Date(a.date) - new Date(b.date));
+            let nextUpcoming = upcomingGames[0];
+            let mostRecentPast = pastGames[0];
+            
+            const nextEventIsLive = teamNextEvent && teamNextEvent.competitions?.[0]?.status?.type?.state === 'in';
+            const nextEventIsUpcoming = teamNextEvent && teamNextEvent.competitions?.[0]?.status?.type?.state === 'pre';
+            
+            let targetEvent;
+            if (liveEvent) {
+              targetEvent = liveEvent;
+            } else if (nextEventIsLive) {
+              targetEvent = teamNextEvent;
+            } else {
+              targetEvent = mostRecentPast || nextUpcoming || teamNextEvent || events[0];
             }
 
             if (!targetEvent) return fallbackCard;
@@ -258,26 +330,76 @@ function TickerApp() {
               return String(c.score);
             };
 
-            const awayLogo = away.team.logo || `https://a.espncdn.com/i/teamlogos/${league}/500/${away.team.abbreviation.toLowerCase()}.png`;
-            const homeLogo = home.team.logo || `https://a.espncdn.com/i/teamlogos/${league}/500/${home.team.abbreviation.toLowerCase()}.png`;
-            
+            const getLogoUrl = (team) => {
+              if (!team) return null;
+              if (team.logo) return team.logo;
+              const logos = team.logos || [];
+              const scoreboard = logos.find(l => l.rel?.includes('scoreboard'));
+              return scoreboard?.href || logos[0]?.href || `https://a.espncdn.com/i/teamlogos/${league}/500/${team.abbreviation?.toLowerCase()}.png`;
+            };
+
             const state = comp.status?.type?.state || targetEvent.status?.type?.state || 'pre';
-            let statusText = String(targetEvent.status?.type?.detail || comp.status?.type?.detail || "Final");
-            let situationObj = null;
+            const gameDate = new Date(targetEvent.date);
+            const now = new Date();
+            const timeDiff = gameDate - now;
             
-            if (league === 'mlb' && state === 'in' && comp.situation) {
-                const sit = comp.situation;
+            let summaryJson = null;
+            if (league === 'mlb' && (state === 'in' || state === 'post')) {
+              try {
+                const summaryRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/summary?event=${targetEvent.id}`, { headers: fetchHeaders });
+                if (summaryRes.ok) {
+                  summaryJson = await summaryRes.json();
+                }
+              } catch (e) {}
+            }
+
+            const summaryComp = summaryJson?.header?.competitions?.[0];
+            const sourceComp = summaryComp || comp;
+            const sourceStatus = sourceComp?.status || comp?.status;
+            const sourceState = sourceStatus?.type?.state || state;
+            const sourceStateKey = String(sourceState || '').toLowerCase();
+            const isLiveState = sourceStateKey === 'in' || sourceStateKey === 'live' || sourceStateKey === 'active';
+            const sourceHome = sourceComp?.competitors?.find(c => c.homeAway === 'home') || home;
+            const sourceAway = sourceComp?.competitors?.find(c => c.homeAway === 'away') || away;
+            const awayLogo = getLogoUrl(sourceAway.team || away.team);
+            const homeLogo = getLogoUrl(sourceHome.team || home.team);
+            const awayScoreValue = parseScore(sourceAway);
+            const homeScoreValue = parseScore(sourceHome);
+            const statusDetail = String(sourceStatus?.type?.detail || sourceStatus?.type?.shortDetail || targetEvent.status?.type?.detail || 'Final');
+            let statusText = statusDetail;
+            let situationObj = null;
+            const currentSituation = league === 'mlb' ? (summaryJson?.situation || sourceComp?.situation || comp.situation || null) : null;
+            
+            if (league === 'mlb' && isLiveState && currentSituation) {
+                const sit = currentSituation;
+                const rawInning = sourceStatus?.type?.shortDetail || statusDetail;
+                const inningLabel = String(rawInning).replace(/^Top\s+/i, '').replace(/^Bot(tom)?\s+/i, '').trim();
+                const balls = sit.balls != null ? sit.balls : 0;
+                const strikes = sit.strikes != null ? sit.strikes : 0;
+                const outs = sit.outs != null ? sit.outs : 0;
+                let onFirst = !!sit.onFirst;
+                let onSecond = !!sit.onSecond;
+                let onThird = !!sit.onThird;
+                if (!onFirst && !onSecond && !onThird && typeof sit.baseState === 'string') {
+                    const base = sit.baseState.trim();
+                    if (base.length >= 3) {
+                        onFirst = base[0] === '1';
+                        onSecond = base[1] === '1';
+                        onThird = base[2] === '1';
+                    }
+                }
                 situationObj = {
-                    onFirst: !!sit.onFirst,
-                    onSecond: !!sit.onSecond,
-                    onThird: !!sit.onThird,
+                    onFirst,
+                    onSecond,
+                    onThird,
+                    balls,
+                    strikes,
+                    outs,
+                    inningLabel,
+                    inningDirection: String(rawInning).startsWith('Top') ? 'TOP' : String(rawInning).startsWith('Bot') || String(rawInning).startsWith('Bottom') ? 'BOT' : '',
                 };
-                const balls = sit.balls || 0;
-                const strikes = sit.strikes || 0;
-                const outs = sit.outs || 0;
-                
+
                 statusText = statusText.replace('Bot ', '▼ ').replace('Top ', '▲ ').replace('Mid ', '▶ ').replace('End ', '◀ ');
-                statusText += ` • ${balls}-${strikes} • ${outs} Out${outs !== 1 ? 's' : ''}`;
             }
 
             let topPlayText = "Game update available.";
@@ -285,28 +407,145 @@ function TickerApp() {
             let leaderStats = "Awaiting Data";
             let leaderSubtext = "Current Game Stats";
 
-            if (state === 'in' && comp.situation?.lastPlay?.text) {
-                topPlayText = comp.situation.lastPlay.text;
+            const playFromSummary = (summary) => {
+              if (!summary?.plays?.length) return null;
+              const lastPlayResult = [...summary.plays].reverse().find(p => p.type === 'play-result' && p.text);
+              if (lastPlayResult?.text) return lastPlayResult.text;
+              return [...summary.plays].reverse().find(p => p.text)?.text || null;
+            };
+
+            if (isLiveState) {
+                const summaryLastPlayText = playFromSummary(summaryJson);
+                if (summaryLastPlayText) {
+                    topPlayText = summaryLastPlayText;
+                } else if (currentSituation?.lastPlay?.text) {
+                    topPlayText = currentSituation.lastPlay.text;
+                } else if (comp.headlines && comp.headlines.length > 0) {
+                    topPlayText = comp.headlines[0].shortLinkText || comp.headlines[0].description;
+                }
             } else if (comp.headlines && comp.headlines.length > 0) {
                 topPlayText = comp.headlines[0].shortLinkText || comp.headlines[0].description;
             }
 
-            try {
-              const summaryRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/summary?event=${targetEvent.id}`, { headers: fetchHeaders });
-              const summaryJson = await summaryRes.json();
+            let playerSectionHeader = 'PLAYER OF THE GAME';
 
-              if (state === 'post' && summaryJson.article?.headline) {
+            try {
+              if (!summaryJson) {
+                const summaryRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/summary?event=${targetEvent.id}`, { headers: fetchHeaders });
+                if (summaryRes.ok) {
+                  summaryJson = await summaryRes.json();
+                }
+              }
+
+              if (state === 'post' && summaryJson?.article?.headline) {
                   topPlayText = summaryJson.article.headline;
-              } else if (summaryJson.article?.headline && topPlayText === "Game update available.") {
+              } else if (summaryJson?.article?.headline && topPlayText === "Game update available.") {
                   topPlayText = summaryJson.article.headline;
               }
               
               if (league === 'mlb') {
-                  if (state === 'in' && comp.situation?.batter) {
-                      leaderName = comp.situation.batter.athlete.shortName || "Current Batter";
-                      leaderStats = comp.situation.batter.summary || "At Bat";
-                  } 
-                  else if (summaryJson.boxscore?.players) {
+                  const liveBatter = (currentSituation?.batter || summaryJson?.situation?.batter || {});
+                  const livePitcher = (currentSituation?.pitcher || summaryJson?.situation?.pitcher || {});
+                  const rawInningStatus = sourceStatus?.type?.shortDetail || sourceStatus?.type?.detail || '';
+                  const isMidInning = /mid/i.test(rawInningStatus);
+                  const isFinalGame = sourceStateKey === 'post' || /final/i.test(rawInningStatus);
+                  const hasLiveBatter = !!liveBatter?.playerId || !!liveBatter?.athlete;
+                  const hasLivePitcher = !!livePitcher?.playerId || !!livePitcher?.athlete;
+
+                  const resolveAthleteFromId = (situationPerson) => {
+                      if (!situationPerson || !summaryJson?.boxscore?.players) return null;
+                      const targetId = String(situationPerson.playerId || situationPerson.id || '');
+                      if (!targetId) return null;
+                      for (const teamBox of summaryJson.boxscore.players) {
+                          for (const category of teamBox.statistics || []) {
+                              if (!category?.athletes) continue;
+                              for (const player of category.athletes) {
+                                  const playerId = String(player.athlete?.id || player.athlete?.playerId || '');
+                                  if (playerId === targetId) return player.athlete;
+                              }
+                          }
+                      }
+                      return null;
+                  };
+
+                  const findAthleteStats = (athlete, categoryMatchers) => {
+                      if (!athlete || !summaryJson?.boxscore?.players) return null;
+                      const athleteId = athlete.playerId ? String(athlete.playerId) : athlete.id ? String(athlete.id) : null;
+                      const athleteName = athlete.shortName || athlete.displayName || athlete.name;
+                      for (const teamBox of summaryJson.boxscore.players) {
+                          const category = teamBox.statistics?.find(s => {
+                              const key = String(s.name || s.type || '').toLowerCase();
+                              return categoryMatchers.some(m => key.includes(m));
+                          });
+                          if (!category?.athletes) continue;
+                          for (const player of category.athletes) {
+                              const playerAthlete = player.athlete || {};
+                              if (athleteId && String(playerAthlete.id) === athleteId) return { category, player };
+                              if (athleteName && (playerAthlete.shortName === athleteName || playerAthlete.displayName === athleteName || playerAthlete.fullName === athleteName)) return { category, player };
+                              if (athleteName && athleteName.includes(' ') && playerAthlete.displayName && playerAthlete.displayName.includes(athleteName.split(' ').slice(-1)[0])) return { category, player };
+                          }
+                      }
+                      return null;
+                  };
+
+                  const formatBattingLine = (category, player) => {
+                      const labels = (category.labels || category.names || []).map(l => String(l).toUpperCase().trim());
+                      const index = (name) => labels.findIndex(l => l === name);
+                      const hab = index('H-AB') > -1 ? player.stats[index('H-AB')] : null;
+                      const hits = index('H') > -1 ? player.stats[index('H')] : null;
+                      const abs = index('AB') > -1 ? player.stats[index('AB')] : null;
+                      const avg = index('AVG') > -1 ? player.stats[index('AVG')] : null;
+                      const hr = index('HR') > -1 ? player.stats[index('HR')] : index('HOMERUNS') > -1 ? player.stats[index('HOMERUNS')] : null;
+                      const rbi = index('RBI') > -1 ? player.stats[index('RBI')] : index('RBIS') > -1 ? player.stats[index('RBIS')] : null;
+                      const runs = index('R') > -1 ? player.stats[index('R')] : null;
+                      const pieces = [];
+                      if (hab) pieces.push(hab);
+                      else if (hits != null && abs != null) pieces.push(`${hits}/${abs}`);
+                      if (avg) pieces.push(`AVG: ${avg}`);
+                      if (hr != null) pieces.push(`HR: ${hr}`);
+                      if (rbi != null) pieces.push(`RBI: ${rbi}`);
+                      if (runs != null) pieces.push(`R: ${runs}`);
+                      return pieces.length ? pieces.join('  |  ') : null;
+                  };
+
+                  const formatPitchingLine = (category, player) => {
+                      const labels = (category.labels || category.names || []).map(l => String(l).toUpperCase().trim());
+                      const index = (name) => labels.findIndex(l => l === name);
+                      const ip = index('IP') > -1 ? player.stats[index('IP')] : null;
+                      const ks = index('K') > -1 ? player.stats[index('K')] : index('SO') > -1 ? player.stats[index('SO')] : null;
+                      const bb = index('BB') > -1 ? player.stats[index('BB')] : null;
+                      const era = index('ERA') > -1 ? player.stats[index('ERA')] : null;
+                      const er = index('ER') > -1 ? player.stats[index('ER')] : null;
+                      const pieces = [];
+                      if (ip) pieces.push(`${ip} IP`);
+                      if (ks) pieces.push(`${ks} K`);
+                      if (bb) pieces.push(`${bb} BB`);
+                      if (er) pieces.push(`ER: ${er}`);
+                      if (era) pieces.push(`ERA: ${era}`);
+                      return pieces.length ? pieces.join('  |  ') : null;
+                  };
+
+                  const resolvedBatter = liveBatter?.athlete || resolveAthleteFromId(liveBatter);
+                  const resolvedPitcher = livePitcher?.athlete || resolveAthleteFromId(livePitcher);
+                  const batterStats = findAthleteStats(resolvedBatter || liveBatter, ['batting', 'battingstats']);
+                  const pitcherStats = findAthleteStats(resolvedPitcher || livePitcher, ['pitching', 'pitcherstats']);
+
+                  if (isLiveState && hasLiveBatter) {
+                      playerSectionHeader = 'AT-BAT';
+                      const batterName = resolvedBatter?.shortName || resolvedBatter?.displayName || liveBatter?.shortName || liveBatter?.displayName || liveBatter?.name || 'Current Batter';
+                      const pitcherName = resolvedPitcher?.shortName || resolvedPitcher?.displayName || livePitcher?.shortName || livePitcher?.displayName || 'Pitcher';
+                      leaderName = batterName;
+                      leaderSubtext = `vs ${pitcherName}`;
+                      const batterLine = batterStats ? formatBattingLine(batterStats.category, batterStats.player) : null;
+                      const pitcherLine = pitcherStats ? formatPitchingLine(pitcherStats.category, pitcherStats.player) : null;
+                      leaderStats = batterLine || liveBatter.summary || 'At Bat';
+
+                      if (hasLivePitcher) {
+                          const pitcherLineText = pitcherLine || livePitcher.summary || 'Pitching';
+                          leaderStats += pitcherLineText ? `\n${pitcherLineText}` : '';
+                      }
+                  } else if ((isMidInning || isFinalGame) && summaryJson?.boxscore?.players) {
+                      playerSectionHeader = 'PLAYER OF THE GAME';
                       let bestScore = -1;
                       summaryJson.boxscore.players.forEach(teamBox => {
                           const batters = teamBox.statistics?.find(s => s.name === 'batting' || s.type === 'batting');
@@ -320,21 +559,19 @@ function TickerApp() {
                               const avgIdx = labels.findIndex(l => l === 'AVG');
 
                               batters.athletes.forEach(a => {
-                                  if (!a.stats || a.didNotPlay) return; 
+                                  if (!a.stats || a.didNotPlay) return;
                                   const hr = hrIdx > -1 ? parseInt(a.stats[hrIdx], 10) || 0 : 0;
                                   const rbi = rbiIdx > -1 ? parseInt(a.stats[rbiIdx], 10) || 0 : 0;
                                   const runs = rIdx > -1 ? parseInt(a.stats[rIdx], 10) || 0 : 0;
                                   const hits = hIdx > -1 ? parseInt(a.stats[hIdx], 10) || 0 : 0;
                                   const abs = abIdx > -1 ? parseInt(a.stats[abIdx], 10) || 0 : 0;
                                   const avg = avgIdx > -1 ? a.stats[avgIdx] : '.000';
-                                  
                                   const score = (hr * 4) + (rbi * 2) + runs + hits;
-                                  
+
                                   if (score > bestScore) {
                                       bestScore = score;
-                                      const name = a.athlete?.shortName || a.athlete?.displayName || "Player";
-                                      const teamAbbr = teamBox.team?.abbreviation || "";
-                                      
+                                      const name = a.athlete?.shortName || a.athlete?.displayName || 'Player';
+                                      const teamAbbr = teamBox.team?.abbreviation || '';
                                       leaderName = teamAbbr ? `${name} (${teamAbbr})` : name;
                                       leaderSubtext = `Season Avg: ${avg}`;
                                       leaderStats = `H/AB: ${hits}/${abs}  |  R: ${runs}  |  RBI: ${rbi}  |  HR: ${hr}`;
@@ -342,6 +579,19 @@ function TickerApp() {
                               });
                           }
                       });
+                  } else {
+                      playerSectionHeader = isFinalGame ? 'PLAYER OF THE GAME' : 'CURRENT GAME';
+                      if (isLiveState && !hasLiveBatter) {
+                          if (livePitcher?.athlete) {
+                              leaderName = livePitcher.athlete.shortName;
+                              leaderSubtext = livePitcher.summary ? `vs ${livePitcher.athlete.shortName}` : 'Awaiting batter';
+                              leaderStats = livePitcher.summary || topPlayText || 'Live updates available';
+                          } else {
+                              leaderName = 'LIVE ACTION';
+                              leaderSubtext = 'Current status';
+                              leaderStats = topPlayText || 'Live updates available';
+                          }
+                      }
                   }
               }
               else if (league === 'nba') {
@@ -546,26 +796,56 @@ function TickerApp() {
             }
 
             const myTeamIsHome = home.team.abbreviation === abbr;
-            const myTeamDisplay = `${abbr}(${record})`;
+
+            let homeRecord = '';
+            if (home.team.abbreviation === abbr) {
+              homeRecord = record;
+            } else if (home.team.record && home.team.record.items && home.team.record.items[0]) {
+              homeRecord = home.team.record.items[0].summary;
+            } else {
+              try {
+                const homeRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/teams/${home.team.abbreviation}`, { headers: fetchHeaders });
+                if (homeRes.ok) {
+                  const homeJson = await homeRes.json();
+                  homeRecord = homeJson.team?.record?.items?.[0]?.summary || '';
+                }
+              } catch (e) {}
+            }
+
+            let awayRecord = '';
+            if (away.team.record && away.team.record.items && away.team.record.items[0]) {
+              awayRecord = away.team.record.items[0].summary;
+            } else {
+              try {
+                const awayRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/teams/${away.team.abbreviation}`, { headers: fetchHeaders });
+                if (awayRes.ok) {
+                  const awayJson = await awayRes.json();
+                  awayRecord = awayJson.team?.record?.items?.[0]?.summary || '';
+                }
+              } catch (e) {}
+            }
 
             return {
               type: 'SPORTS',
               data: {
                 league: league.toUpperCase(),
                 date: dateText,
-                awayAbbr: myTeamIsHome ? away.team.abbreviation : myTeamDisplay,
-                awayScore: parseScore(away),
-                awayName: away.team.name || away.team.shortDisplayName,
+                awayAbbr: sourceAway.team.abbreviation || away.team.abbreviation,
+                awayScore: awayScoreValue,
+                awayRecord: awayRecord,
+                awayName: sourceAway.team.name || sourceAway.team.shortDisplayName || away.team.name || away.team.shortDisplayName,
                 awayLogo: awayLogo,
-                homeAbbr: myTeamIsHome ? myTeamDisplay : home.team.abbreviation,
-                homeScore: parseScore(home),
-                homeName: home.team.name || home.team.shortDisplayName,
+                homeAbbr: sourceHome.team.abbreviation || home.team.abbreviation,
+                homeScore: homeScoreValue,
+                homeRecord: homeRecord,
+                homeName: sourceHome.team.name || sourceHome.team.shortDisplayName || home.team.name || home.team.shortDisplayName,
                 homeLogo: homeLogo,
                 status: statusText,
                 situation: situationObj,
                 topPlay: topPlayText,
                 teamColor: myTeamColor,
                 nextGame: { date: nextGameText, opponent: nextOpponent },
+                playerSectionHeader: playerSectionHeader,
                 playerGlance: {
                   name: `${leaderName.toUpperCase()}`,
                   subtext: leaderSubtext,
@@ -605,16 +885,21 @@ function TickerApp() {
             if (myGames.length === 0) return { type: 'ERROR' };
             
             myGames.sort((a, b) => {
-                const dateA = a.date_played || "";
-                const dateB = b.date_played || "";
-                return dateA.localeCompare(dateB);
+                const dateA = new Date(a.date_played);
+                const dateB = new Date(b.date_played);
+                return dateA - dateB;
             });
 
-            let targetGame = myGames.find(g => String(g.status) === '2' || String(g.status) === 'In Progress');
+            let pastGames = myGames.filter(g => String(g.status) !== '1' && String(g.status) !== 'Scheduled' && String(g.status) !== '2');
+            let upcomingGames = myGames.filter(g => String(g.status) === '1' || String(g.status) === 'Scheduled');
+            let nextUpcoming = upcomingGames[0];
+            let mostRecentPast = pastGames[pastGames.length - 1]; // since sorted ascending
             
-            if (!targetGame) {
-               const pastGames = myGames.filter(g => String(g.status) !== '1' && String(g.status) !== 'Scheduled');
-               targetGame = pastGames.length > 0 ? pastGames[pastGames.length - 1] : myGames[0];
+            let targetGame;
+            if (nextUpcoming && (new Date(nextUpcoming.date_played) - new Date()) <= 10 * 60 * 1000) {
+              targetGame = nextUpcoming;
+            } else {
+              targetGame = mostRecentPast || nextUpcoming || myGames[0];
             }
 
             if (!targetGame) return { type: 'ERROR' };
@@ -636,7 +921,7 @@ function TickerApp() {
             if (targetGame.game_status) statusText = targetGame.game_status; 
             else if (['1', 'Scheduled'].includes(statCode)) statusText = 'Scheduled';
             else if (['2', 'In Progress'].includes(statCode)) statusText = 'Live';
-            else if (['3', '4', '5'].includes(statCode)) statusText = 'Final'; 
+            else if (['3', '4', '5'].includes(statCode)) statusText = 'Final';
 
             const myTeamIsHome = targetGame.home_team_name.includes(teamName) || targetGame.home_team_name.includes('New York');
             
@@ -671,12 +956,14 @@ function TickerApp() {
               data: {
                 league: 'PWHL',
                 date: dateText,
-                awayAbbr: myTeamIsHome ? targetGame.visiting_team_code : myTeamDisplay,
+                awayAbbr: targetGame.visiting_team_code,
                 awayScore: targetGame.visiting_goal_count || "0",
+                awayRecord: (targetGame.visiting_wins !== undefined && targetGame.visiting_losses !== undefined) ? `${targetGame.visiting_wins}-${targetGame.visiting_losses}` : '',
                 awayName: targetGame.visiting_team_name,
                 awayLogo: `https://assets.leaguestat.com/pwhl/logos/50x50/${targetGame.visiting_team}.png`,
-                homeAbbr: myTeamIsHome ? myTeamDisplay : targetGame.home_team_code,
+                homeAbbr: targetGame.home_team_code,
                 homeScore: targetGame.home_goal_count || "0",
+                homeRecord: (targetGame.home_wins !== undefined && targetGame.home_losses !== undefined) ? `${targetGame.home_wins}-${targetGame.home_losses}` : '',
                 homeName: targetGame.home_team_name,
                 homeLogo: `https://assets.leaguestat.com/pwhl/logos/50x50/${targetGame.home_team}.png`,
                 status: statusText,
@@ -698,8 +985,9 @@ function TickerApp() {
         const rangers = await fetchEspnTeam('hockey', 'nhl', 'NYR', 'Rangers'); 
         const giants = await fetchEspnTeam('football', 'nfl', 'NYG', 'Giants'); 
         const sirens = await fetchPwhlTeam('Sirens', 'NY');
+        const mariners = await fetchEspnTeam('baseball', 'mlb', 'SEA', 'Mariners');
 
-        const sportsCards = [yankees, knicks, rangers, giants, sirens].filter(item => item && item.type !== 'ERROR' && item.data);
+        const sportsCards = [yankees, knicks, rangers, giants, sirens, mariners].filter(item => item && item.type !== 'ERROR' && item.data);
         
         // GROUP ALGORITHM: News first, then Sports
         let grouped = [];
@@ -712,12 +1000,13 @@ function TickerApp() {
       } catch (e) {
         console.error("Critical failure building display:", e);
       }
-    };
+    }, []);
 
+  useEffect(() => {
     fetchData();
     const dataInterval = setInterval(fetchData, 300000); 
     return () => clearInterval(dataInterval);
-  }, []);
+  }, [fetchData]);
 
   useEffect(() => {
     if (displayCycle.length === 0) return;
@@ -725,7 +1014,7 @@ function TickerApp() {
     progressAnim.setValue(0);
     Animated.timing(progressAnim, {
       toValue: 1,
-      duration: 5000,
+      duration: 8000,
       easing: Easing.linear,
       useNativeDriver: false,
     }).start();
@@ -772,10 +1061,27 @@ function TickerApp() {
           useNativeDriver: true,
         }).start();
       });
-    }, 4700); // Trigger the fade 300ms before the 5s interval completes
+    }, 7700); // Trigger the fade 300ms before the 8s interval completes
     
     return () => clearTimeout(timer);
   }, [currentIndex, displayCycle.length]);
+
+  useEffect(() => {
+    if (displayCycle.length === 0) return;
+    const nextIndex = (currentIndex + 1) % displayCycle.length;
+    const nextItem = displayCycle[nextIndex];
+    if (nextItem?.type === 'SPORTS') {
+      fetchData();
+    }
+  }, [currentIndex, displayCycle.length, fetchData]);
+
+  if (!fontsLoaded) {
+    return (
+      <SafeAreaView style={styles.wrapper}>
+        <ActivityIndicator size="large" color="#0A84FF" />
+      </SafeAreaView>
+    );
+  }
 
   if (loading || displayCycle.length === 0) {
     return (
@@ -796,6 +1102,28 @@ function TickerApp() {
   }
 
   const dynamicCardColor = currentItem.data.teamColor || '#15234b';
+  const getLuminance = (hex) => {
+    try {
+      const c = hex.replace('#','');
+      const r = parseInt(c.substring(0,2),16)/255;
+      const g = parseInt(c.substring(2,4),16)/255;
+      const b = parseInt(c.substring(4,6),16)/255;
+      const a = [r,g,b].map(v => (v <= 0.03928) ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4));
+      return 0.2126*a[0] + 0.7152*a[1] + 0.0722*a[2];
+    } catch (e) {
+      return 0;
+    }
+  };
+  const cardLuminance = getLuminance(dynamicCardColor);
+  const logoTint = cardLuminance < 0.25 ? '#FFFFFF' : undefined;
+  const singleColorLogoPatterns = ['yankees', 'nyy', 'pinstripe'];
+  const shouldTintLogo = (logoUri) => {
+    if (!logoTint || !logoUri) return false;
+    try {
+      const lower = String(logoUri).toLowerCase();
+      return singleColorLogoPatterns.some(p => lower.includes(p));
+    } catch (e) { return false; }
+  };
   const timeString = currentTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
   const dateString = currentTime.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 
@@ -823,10 +1151,8 @@ function TickerApp() {
                 <Text style={styles.infoValue}>{hebrewDate || "Loading..."}</Text>
               </View>
               <View style={styles.infoBlock}>
-                <Text style={styles.infoLabel}>TZEVAH ADOM (24H)</Text>
-                <View style={styles.alertBadge}>
-                  <Text style={styles.alertText}>{alertsCount} ALERTS</Text>
-                </View>
+                <Text style={styles.infoLabel}>HAVDALAH</Text>
+                <Text style={styles.infoValue}>{havdalahTime || 'Calculating...'}</Text>
               </View>
             </View>
           ) : (
@@ -871,47 +1197,52 @@ function TickerApp() {
                   {/* Away Team */}
                   <View style={styles.teamColLeft}>
                     <View style={styles.teamRow}>
-                      {currentItem.data.awayLogo && (
+                       {currentItem.data.awayLogo && (
                          <View style={styles.logoWrapper}>
-                            <Image source={{ uri: currentItem.data.awayLogo }} style={styles.teamLogo} resizeMode="contain" />
+                           <Image source={{ uri: currentItem.data.awayLogo }} style={[styles.teamLogo, shouldTintLogo(currentItem.data.awayLogo) && { tintColor: logoTint }]} resizeMode="contain" />
                          </View>
-                      )}
+                       )}
                       <Text style={styles.scoreNum}>{currentItem.data.awayScore}</Text>
                     </View>
                     <Text style={styles.teamName}>{currentItem.data.awayAbbr}</Text>
+                    <Text style={styles.teamRecord}>{currentItem.data.awayRecord || '0-0'}</Text>
                   </View>
 
                   {/* Center Status */}
                   <View style={styles.centerCol}>
                     {currentItem.data.league === 'MLB' && currentItem.data.situation ? (
-                       <View style={styles.basesContainer}>
-                         <View style={[styles.base, currentItem.data.situation.onSecond && styles.baseActive, styles.baseTop]} />
-                         <View style={styles.basesRow}>
-                           <View style={[styles.base, currentItem.data.situation.onThird && styles.baseActive]} />
-                           <View style={[styles.base, currentItem.data.situation.onFirst && styles.baseActive]} />
-                         </View>
-                       </View>
+                      <View style={styles.mlbLiveStatus}>
+                        <Text style={styles.mlbCountText}>{`${currentItem.data.situation.balls}-${currentItem.data.situation.strikes}  •  ${currentItem.data.situation.outs} out${currentItem.data.situation.outs !== 1 ? 's' : ''}`}</Text>
+                        <View style={styles.basesContainer}>
+                          <View style={[styles.base, currentItem.data.situation.onSecond && styles.baseActive, styles.baseTop]} />
+                          <View style={styles.basesRow}>
+                            <View style={[styles.base, currentItem.data.situation.onThird && styles.baseActive]} />
+                            <View style={[styles.base, currentItem.data.situation.onFirst && styles.baseActive]} />
+                          </View>
+                        </View>
+                        <Text style={styles.mlbInningText}>{currentItem.data.situation.inningLabel || currentItem.data.status}</Text>
+                      </View>
                     ) : (
-                       <View style={styles.dotsRow}>
-                         <View style={styles.dot} /><View style={styles.dot} /><View style={styles.dot} />
-                       </View>
+                      <View style={styles.centerStatusFallback}>
+                        <View style={styles.dotsRow}>
+                          <View style={styles.dot} /><View style={styles.dot} /><View style={styles.dot} />
+                        </View>
+                        <Text style={[styles.statusText, currentItem.data.situation && { color: '#FFD700' }]}>{currentItem.data.status}</Text>
+                      </View>
                     )}
-                    <Text style={[styles.statusText, currentItem.data.situation && { color: '#FFD700' }]}>
-                      {currentItem.data.status}
-                    </Text>
                   </View>
-
                   {/* Home Team */}
                   <View style={styles.teamColRight}>
                     <View style={styles.teamRow}>
-                      <Text style={styles.scoreNum}>{currentItem.data.homeScore}</Text>
-                      {currentItem.data.homeLogo && (
+                       <Text style={styles.scoreNum}>{currentItem.data.homeScore}</Text>
+                       {currentItem.data.homeLogo && (
                          <View style={styles.logoWrapper}>
-                            <Image source={{ uri: currentItem.data.homeLogo }} style={styles.teamLogo} resizeMode="contain" />
+                           <Image source={{ uri: currentItem.data.homeLogo }} style={[styles.teamLogo, shouldTintLogo(currentItem.data.homeLogo) && { tintColor: logoTint }]} resizeMode="contain" />
                          </View>
-                      )}
+                       )}
                     </View>
                     <Text style={styles.teamNameRight}>{currentItem.data.homeAbbr}</Text>
+                    <Text style={styles.teamRecordRight}>{currentItem.data.homeRecord || '0-0'}</Text>
                   </View>
                 </View>
               </View>
@@ -923,12 +1254,12 @@ function TickerApp() {
 
               <View style={styles.playerSection}>
                 <View style={styles.playerSectionHeaderWrap}>
-                  <Text style={styles.playerSectionHeader}>PLAYER OF THE GAME</Text>
+                  <Text style={styles.playerSectionHeader}>{currentItem.data.playerSectionHeader || 'PLAYER OF THE GAME'}</Text>
                 </View>
                 <View style={styles.playerSectionBody}>
                    <Text style={styles.playerName}>{currentItem.data.playerGlance.name}</Text>
                    <Text style={styles.playerSubtext}>{currentItem.data.playerGlance.subtext}</Text>
-                   <Text style={styles.playerStatsRow} numberOfLines={2} adjustsFontSizeToFit>{currentItem.data.playerGlance.stats}</Text>
+                   <Text style={styles.playerStatsRow} numberOfLines={currentItem.data.playerSectionHeader === 'AT-BAT' ? 5 : 2} adjustsFontSizeToFit>{currentItem.data.playerGlance.stats}</Text>
                 </View>
               </View>
 
@@ -1074,13 +1405,11 @@ const styles = StyleSheet.create({
   teamRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 15
+    gap: 20
   },
   logoWrapper: {
-    width: 52,
-    height: 52,
-    backgroundColor: '#FFFFFF',
-    borderRadius: 26,
+    width: 64,
+    height: 64,
     justifyContent: 'center',
     alignItems: 'center',
     shadowColor: '#000',
@@ -1088,15 +1417,16 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 4,
     elevation: 5,
+    backgroundColor: 'transparent'
   },
   teamLogo: {
-    width: 36,
-    height: 36,
+    width: 48,
+    height: 48,
   },
   scoreNum: {
     color: '#ffffff',
     fontFamily: 'SFShields',
-    fontSize: 48,
+    fontSize: 56,
     fontWeight: '800',
     textShadowColor: 'rgba(0, 0, 0, 0.5)',
     textShadowOffset: { width: 0, height: 1 },
@@ -1105,7 +1435,7 @@ const styles = StyleSheet.create({
   teamName: {
     color: '#EBEBF5',
     opacity: 0.9,
-    fontSize: 16,
+    fontSize: 18,
     marginTop: 8,
     fontWeight: '700',
     textShadowColor: 'rgba(0, 0, 0, 0.4)',
@@ -1115,13 +1445,28 @@ const styles = StyleSheet.create({
   teamNameRight: {
     color: '#EBEBF5',
     opacity: 0.9,
-    fontSize: 16,
+    fontSize: 18,
     marginTop: 8,
     fontWeight: '700',
     textAlign: 'right',
     textShadowColor: 'rgba(0, 0, 0, 0.4)',
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 2,
+  },
+  teamRecord: {
+    color: '#EBEBF5',
+    opacity: 0.8,
+    fontSize: 14,
+    marginTop: 4,
+    fontWeight: '600'
+  },
+  teamRecordRight: {
+    color: '#EBEBF5',
+    opacity: 0.8,
+    fontSize: 14,
+    marginTop: 4,
+    fontWeight: '600',
+    textAlign: 'right'
   },
   centerCol: {
     flex: 0.8,
@@ -1148,6 +1493,26 @@ const styles = StyleSheet.create({
   },
   baseTop: {
     marginBottom: 4,
+  },
+  mlbLiveStatus: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mlbCountText: {
+    color: '#FFFFFF',
+    opacity: 0.85,
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  mlbInningText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
+    marginTop: 6,
+  },
+  centerStatusFallback: {
+    alignItems: 'center',
   },
   dotsRow: {
     flexDirection: 'row',
