@@ -4,6 +4,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { useKeepAwake } from 'expo-keep-awake';
 import { useFonts } from 'expo-font';
 import * as Location from 'expo-location';
+import * as ScreenOrientation from 'expo-screen-orientation';
 
 const fetchHeaders = {
   'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
@@ -1007,6 +1008,15 @@ function TickerApp() {
     const dataInterval = setInterval(fetchData, 300000); 
     return () => clearInterval(dataInterval);
   }, [fetchData]);
+
+  useEffect(() => {
+    async function lockOrientation() {
+      if (fontsLoaded && !loading) {
+        await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
+      }
+    }
+    lockOrientation().catch(err => console.warn("Orientation lock error:", err));
+  }, [fontsLoaded, loading]);
 
   useEffect(() => {
     if (displayCycle.length === 0) return;

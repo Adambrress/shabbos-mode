@@ -3,7 +3,7 @@
     "name": "shabbos-mode",
     "slug": "snack-685f2a47-403a-4f67-acda-dc9ea22fd3ed",
     "version": "1.0.0",
-    "orientation": "landscape",
+    "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
