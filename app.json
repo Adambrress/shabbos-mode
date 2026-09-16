@@ -1,29 +1,50 @@
 {
   "expo": {
-    "name": "shabbos-mode",
-    "slug": "snack-685f2a47-403a-4f67-acda-dc9ea22fd3ed",
-    "version": "1.0.0",
-    "orientation": "landscape",
+    "owner": "adambromberg-2",
+    "name": "Shabbos Mode",
+    "slug": "shabbat-mode-official",
+    "version": "4.0.1",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/splash-v2.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.adambromberg.snack685f2a47403a4f67acdadc9ea22fd3ed",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.adambromberg.snack685f2a47403a4f67acdadc9ea22fd3ed"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "af240031-0c78-4ec9-ac01-8646ea3146ee"
+      }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/af240031-0c78-4ec9-ac01-8646ea3146ee"
+    },
+    "orientation": "landscape",
+    "plugins": [
+      "expo-font",
+      "expo-status-bar"
+    ]
   }
 }
